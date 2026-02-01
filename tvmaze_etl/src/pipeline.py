@@ -129,16 +129,11 @@ class TVMazePipeline:
         logger.info("--- Starting Phase B: Normalization ---")
         # Fetch latest data from DuckDB (Source of Truth)
         raw_data_from_db = self.fetch_latest_raw_data()
-        df_normalized = self.process_normalization(raw_data_from_db)
+        self.process_normalization(raw_data_from_db)
 
         # --- PHASE C: ENRICHMENT ---
         logger.info("--- Starting Phase C: Enrichment ---")
-        enriched_file, stats_file = self.process_enrichment(df_normalized)
-
-        # --- PHASE D: LOADING DERIVED DATA TO DUCKDB ---
-        logger.info("--- Loading Derived Data to DuckDB ---")
-        norm_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
-        self.load_derived_to_duckdb(norm_file, enriched_file, stats_file)
+        self.process_enrichment()
 
         logger.info("--- Pipeline Finished Successfully ---")
 
@@ -164,10 +159,34 @@ class TVMazePipeline:
         output_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
         df.write_parquet(output_file)
         
-        logger.info(f"Phase B Complete. Saved {len(df)} clean records to {output_file.name}")
-        return df
+        # Load to DuckDB immediately
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                con.execute("DROP TABLE IF EXISTS normalized_shows")
+                con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{output_file}')")
+        except duckdb.IOException as e:
+            logger.error(f"Could not write to DuckDB: {e}")
+            raise
+        
+        logger.info(f"Phase B Complete. Saved {len(df)} clean records to {output_file.name} and loaded to DB.")
 
-    def process_enrichment(self, df: pl.DataFrame):
+    def process_enrichment(self):
+        # Fetch normalized data from DuckDB
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                logger.info("Fetching normalized data from DuckDB...")
+                result = con.execute("SELECT * FROM normalized_shows")
+                columns = [desc[0] for desc in result.description]
+                data = [dict(zip(columns, row)) for row in result.fetchall()]
+        except duckdb.IOException as e:
+            logger.error(f"Could not read from DuckDB: {e}")
+            raise
+
+        df = pl.DataFrame(data)
+        # Ensure premiere_date is Date type (Polars usually infers from datetime.date objects, but strict casting ensures safety)
+        if "premiere_date" in df.columns and df["premiere_date"].dtype != pl.Date:
+             df = df.with_columns(pl.col("premiere_date").cast(pl.Date, strict=False))
+
         # 1. Content Availability: Years since air & Active status
         # We assume 'status' == 'Running' means active.
         current_year = datetime.now().year
@@ -203,8 +222,19 @@ class TVMazePipeline:
         stats_file = ENRICHED_DIR / f"genre_stats_{self.timestamp}.parquet"
         genre_stats.write_parquet(stats_file)
 
-        logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name}")
-        return enriched_file, stats_file
+        # Load to DuckDB
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                con.execute("DROP TABLE IF EXISTS enriched_shows")
+                con.execute(f"CREATE TABLE enriched_shows AS SELECT * FROM read_parquet('{enriched_file}')")
+
+                con.execute("DROP TABLE IF EXISTS genre_stats")
+                con.execute(f"CREATE TABLE genre_stats AS SELECT * FROM read_parquet('{stats_file}')")
+        except duckdb.IOException as e:
+            logger.error(f"Could not write to DuckDB: {e}")
+            raise
+
+        logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name} and loaded to DB.")
 
     def fetch_latest_raw_data(self):
         """Fetch the latest version of raw data from DuckDB for processing."""
@@ -282,31 +312,6 @@ class TVMazePipeline:
             # Clean up temp table
             con.execute("DROP TABLE IF EXISTS current_batch")
             
-        finally:
-            con.close()
-
-    def load_derived_to_duckdb(self, norm_file, enriched_file, stats_file):
-        """Load normalized and enriched Parquet files into DuckDB."""
-        try:
-            con = duckdb.connect(str(self.db_path))
-        except duckdb.IOException as e:
-            logger.error(f"Could not acquire lock on DuckDB file: {self.db_path}")
-            return
-
-        try:
-            # Load Normalized Data (Parquet)
-            con.execute("DROP TABLE IF EXISTS normalized_shows")
-            con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{norm_file}')")
-            
-            # Load Enriched Data
-            con.execute("DROP TABLE IF EXISTS enriched_shows")
-            con.execute(f"CREATE TABLE enriched_shows AS SELECT * FROM read_parquet('{enriched_file}')")
-
-            # Load Genre Stats
-            con.execute("DROP TABLE IF EXISTS genre_stats")
-            con.execute(f"CREATE TABLE genre_stats AS SELECT * FROM read_parquet('{stats_file}')")
-            
-            logger.info(f"DuckDB Load Complete. Derived tables updated in {self.db_path.name}")
         finally:
             con.close()
 
