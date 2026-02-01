@@ -13,7 +13,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # --- CONFIGURATION ---
 API_URL = "https://api.tvmaze.com/shows"
 # Define paths relative to the script execution
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 NORM_DIR = BASE_DIR / "data" / "normalized"
 ENRICHED_DIR = BASE_DIR / "data" / "enriched"
@@ -123,12 +123,14 @@ class TVMazePipeline:
 
         # --- PHASE C: ENRICHMENT ---
         logger.info("--- Starting Phase C: Enrichment ---")
-        self.process_enrichment(df_normalized)
+        enriched_file, stats_file = self.process_enrichment(df_normalized)
 
         # --- PHASE D: LOADING TO DUCKDB ---
         logger.info("--- Starting Phase D: Loading to DuckDB ---")
         norm_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
-        self.load_to_duckdb(raw_file, norm_file)
+        self.load_to_duckdb(raw_file, norm_file, enriched_file, stats_file)
+
+        logger.info("--- Pipeline Finished Successfully ---")
 
     def process_normalization(self, raw_data):
         valid_records = []
@@ -192,21 +194,71 @@ class TVMazePipeline:
         genre_stats.write_parquet(stats_file)
 
         logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name}")
+        return enriched_file, stats_file
 
-    def load_to_duckdb(self, raw_file, norm_file):
+    def load_to_duckdb(self, raw_file, norm_file, enriched_file, stats_file):
         """Load generated files into DuckDB tables."""
-        con = duckdb.connect(str(self.db_path))
-        
-        # Load Raw Data (JSONL)
-        con.execute("DROP TABLE IF EXISTS raw_shows")
-        con.execute(f"CREATE TABLE raw_shows AS SELECT * FROM read_json_auto('{raw_file}')")
-        
-        # Load Normalized Data (Parquet)
-        con.execute("DROP TABLE IF EXISTS normalized_shows")
-        con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{norm_file}')")
-        
-        logger.info(f"DuckDB Load Complete. Tables 'raw_shows' and 'normalized_shows' created in {self.db_path.name}")
-        con.close()
+        try:
+            con = duckdb.connect(str(self.db_path))
+        except duckdb.IOException as e:
+            logger.error(f"Could not acquire lock on DuckDB file: {self.db_path}")
+            logger.error(f"Please close any external viewers (e.g., DataGrip, DBeaver) and try again. Error: {e}")
+            return
+
+        try:
+            # --- Load Raw Data (JSONL) with Versioning ---
+            # 1. Load the new batch into a temporary table
+            con.execute(f"CREATE OR REPLACE TEMP TABLE current_batch AS SELECT * FROM read_json_auto('{raw_file}')")
+
+            # 2. Check if the persistent table 'raw_shows' exists
+            table_check = con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'raw_shows'").fetchone()
+            table_exists = table_check[0] > 0 if table_check else False
+
+            if table_exists:
+                # Migration: Ensure 'version' column exists if table was created by older pipeline
+                cols = [row[1] for row in con.execute("PRAGMA table_info('raw_shows')").fetchall()]
+                if 'version' not in cols:
+                    logger.info("Migrating 'raw_shows': Adding 'version' column.")
+                    con.execute("ALTER TABLE raw_shows ADD COLUMN version INTEGER DEFAULT 1")
+
+                # Append with version increment
+                append_query = """
+                INSERT INTO raw_shows 
+                SELECT 
+                    cb.*, 
+                    COALESCE(existing.max_ver, 0) + 1 AS version
+                FROM current_batch cb
+                LEFT JOIN (
+                    SELECT id, MAX(version) as max_ver 
+                    FROM raw_shows 
+                    GROUP BY id
+                ) existing ON cb.id = existing.id
+                """
+                con.execute(append_query)
+                logger.info("Appended new batch to 'raw_shows' with versioning.")
+            else:
+                # First run: Create table and initialize version to 1
+                con.execute("CREATE TABLE raw_shows AS SELECT *, 1 AS version FROM current_batch")
+                logger.info("Created table 'raw_shows' with initial data.")
+
+            # Clean up temp table
+            con.execute("DROP TABLE IF EXISTS current_batch")
+            
+            # Load Normalized Data (Parquet)
+            con.execute("DROP TABLE IF EXISTS normalized_shows")
+            con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{norm_file}')")
+            
+            # Load Enriched Data
+            con.execute("DROP TABLE IF EXISTS enriched_shows")
+            con.execute(f"CREATE TABLE enriched_shows AS SELECT * FROM read_parquet('{enriched_file}')")
+
+            # Load Genre Stats
+            con.execute("DROP TABLE IF EXISTS genre_stats")
+            con.execute(f"CREATE TABLE genre_stats AS SELECT * FROM read_parquet('{stats_file}')")
+            
+            logger.info(f"DuckDB Load Complete. Tables 'raw_shows', 'normalized_shows', 'enriched_shows', and 'genre_stats' created in {self.db_path.name}")
+        finally:
+            con.close()
 
 if __name__ == "__main__":
     pipeline = TVMazePipeline()
