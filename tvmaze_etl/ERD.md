@@ -8,15 +8,27 @@ erDiagram
     %% Ingested directly from JSONL
     raw_shows {
         INTEGER id
+        STRING url
         STRING name
         STRING type
         STRING language
         STRING[] genres
         STRING status
         INTEGER runtime
+        INTEGER averageRuntime
         STRING premiered
+        STRING ended
+        STRING officialSite
+        STRUCT schedule
         STRUCT rating
+        INTEGER weight
+        STRUCT network
+        STRUCT webChannel
+        STRUCT externals
+        STRUCT image
         STRING summary
+        INTEGER updated
+        STRUCT _links
         INTEGER version "SCD Type 2 Version"
         BOOLEAN is_latest "Current Record Flag"
     }
