@@ -18,7 +18,7 @@ RAW_DIR = BASE_DIR / "data" / "raw"
 NORM_DIR = BASE_DIR / "data" / "normalized"
 ENRICHED_DIR = BASE_DIR / "data" / "enriched"
 DB_DIR = BASE_DIR / "data" / "db"
-MIN_ITEMS = 250
+MIN_PAGES = 5  # Set to None to fetch all pages
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -99,7 +99,11 @@ class TVMazePipeline:
         page = 0
         
         logger.info("--- Starting Phase A: Raw Ingestion ---")
-        while len(all_raw_data) < MIN_ITEMS:
+        while True:
+            if MIN_PAGES is not None and page >= MIN_PAGES:
+                logger.info(f"Reached configured limit of {MIN_PAGES} pages.")
+                break
+
             try:
                 data = self.fetch_page(page)
                 if not data: break # Stop if empty
