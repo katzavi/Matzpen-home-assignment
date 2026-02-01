@@ -13,12 +13,12 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # --- CONFIGURATION ---
 API_URL = "https://api.tvmaze.com/shows"
 # Define paths relative to the script execution
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 NORM_DIR = BASE_DIR / "data" / "normalized"
 ENRICHED_DIR = BASE_DIR / "data" / "enriched"
 DB_DIR = BASE_DIR / "data" / "db"
-MIN_ITEMS = 250
+MIN_PAGES = 5  # Set to None to fetch all pages
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -99,7 +99,11 @@ class TVMazePipeline:
         page = 0
         
         logger.info("--- Starting Phase A: Raw Ingestion ---")
-        while len(all_raw_data) < MIN_ITEMS:
+        while True:
+            if MIN_PAGES is not None and page >= MIN_PAGES:
+                logger.info(f"Reached configured limit of {MIN_PAGES} pages.")
+                break
+
             try:
                 data = self.fetch_page(page)
                 if not data: break # Stop if empty
@@ -117,18 +121,21 @@ class TVMazePipeline:
         
         logger.info(f"Phase A Complete. Saved {len(all_raw_data)} raw records to {raw_file.name}")
 
+        # --- PHASE A.5: LOAD RAW TO DUCKDB ---
+        logger.info("--- Loading Raw Data to DuckDB ---")
+        self.ingest_raw_data(raw_file)
+
         # --- PHASE B: NORMALIZATION ---
         logger.info("--- Starting Phase B: Normalization ---")
-        df_normalized = self.process_normalization(all_raw_data)
+        # Fetch latest data from DuckDB (Source of Truth)
+        raw_data_from_db = self.fetch_latest_raw_data()
+        self.process_normalization(raw_data_from_db)
 
         # --- PHASE C: ENRICHMENT ---
         logger.info("--- Starting Phase C: Enrichment ---")
-        self.process_enrichment(df_normalized)
+        self.process_enrichment()
 
-        # --- PHASE D: LOADING TO DUCKDB ---
-        logger.info("--- Starting Phase D: Loading to DuckDB ---")
-        norm_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
-        self.load_to_duckdb(raw_file, norm_file)
+        logger.info("--- Pipeline Finished Successfully ---")
 
     def process_normalization(self, raw_data):
         valid_records = []
@@ -146,16 +153,40 @@ class TVMazePipeline:
         df = pl.DataFrame(valid_records)
 
         # Ensure Date Column is actual Date Type (not string)
-        df = df.with_columns(pl.col("premiere_date").str.to_date(strict=False))
+        df = df.with_columns(pl.col("premiere_date").cast(pl.Date, strict=False))
 
         # Save as Parquet (Optimized for DuckDB)
         output_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
         df.write_parquet(output_file)
         
-        logger.info(f"Phase B Complete. Saved {len(df)} clean records to {output_file.name}")
-        return df
+        # Load to DuckDB immediately
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                con.execute("DROP TABLE IF EXISTS normalized_shows")
+                con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{output_file}')")
+        except duckdb.IOException as e:
+            logger.error(f"Could not write to DuckDB: {e}")
+            raise
+        
+        logger.info(f"Phase B Complete. Saved {len(df)} clean records to {output_file.name} and loaded to DB.")
 
-    def process_enrichment(self, df: pl.DataFrame):
+    def process_enrichment(self):
+        # Fetch normalized data from DuckDB
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                logger.info("Fetching normalized data from DuckDB...")
+                result = con.execute("SELECT * FROM normalized_shows")
+                columns = [desc[0] for desc in result.description]
+                data = [dict(zip(columns, row)) for row in result.fetchall()]
+        except duckdb.IOException as e:
+            logger.error(f"Could not read from DuckDB: {e}")
+            raise
+
+        df = pl.DataFrame(data)
+        # Ensure premiere_date is Date type (Polars usually infers from datetime.date objects, but strict casting ensures safety)
+        if "premiere_date" in df.columns and df["premiere_date"].dtype != pl.Date:
+             df = df.with_columns(pl.col("premiere_date").cast(pl.Date, strict=False))
+
         # 1. Content Availability: Years since air & Active status
         # We assume 'status' == 'Running' means active.
         current_year = datetime.now().year
@@ -191,22 +222,98 @@ class TVMazePipeline:
         stats_file = ENRICHED_DIR / f"genre_stats_{self.timestamp}.parquet"
         genre_stats.write_parquet(stats_file)
 
-        logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name}")
+        # Load to DuckDB
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                con.execute("DROP TABLE IF EXISTS enriched_shows")
+                con.execute(f"CREATE TABLE enriched_shows AS SELECT * FROM read_parquet('{enriched_file}')")
 
-    def load_to_duckdb(self, raw_file, norm_file):
-        """Load generated files into DuckDB tables."""
-        con = duckdb.connect(str(self.db_path))
-        
-        # Load Raw Data (JSONL)
-        con.execute("DROP TABLE IF EXISTS raw_shows")
-        con.execute(f"CREATE TABLE raw_shows AS SELECT * FROM read_json_auto('{raw_file}')")
-        
-        # Load Normalized Data (Parquet)
-        con.execute("DROP TABLE IF EXISTS normalized_shows")
-        con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{norm_file}')")
-        
-        logger.info(f"DuckDB Load Complete. Tables 'raw_shows' and 'normalized_shows' created in {self.db_path.name}")
-        con.close()
+                con.execute("DROP TABLE IF EXISTS genre_stats")
+                con.execute(f"CREATE TABLE genre_stats AS SELECT * FROM read_parquet('{stats_file}')")
+        except duckdb.IOException as e:
+            logger.error(f"Could not write to DuckDB: {e}")
+            raise
+
+        logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name} and loaded to DB.")
+
+    def fetch_latest_raw_data(self):
+        """Fetch the latest version of raw data from DuckDB for processing."""
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                logger.info("Fetching latest raw records from DuckDB...")
+                # Fetch data and convert to list of dicts manually to avoid pyarrow dependency
+                result = con.execute("SELECT * FROM raw_shows WHERE is_latest = TRUE")
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except duckdb.IOException as e:
+            logger.error(f"Could not read from DuckDB: {e}")
+            raise
+
+    def ingest_raw_data(self, raw_file):
+        """Load raw JSONL into DuckDB with versioning."""
+        try:
+            con = duckdb.connect(str(self.db_path))
+        except duckdb.IOException as e:
+            logger.error(f"Could not acquire lock on DuckDB file: {self.db_path}")
+            logger.error(f"Please close any external viewers (e.g., DataGrip, DBeaver) and try again. Error: {e}")
+            return
+
+        try:
+            # --- Load Raw Data (JSONL) with Versioning ---
+            # 1. Load the new batch into a temporary table
+            con.execute(f"CREATE OR REPLACE TEMP TABLE current_batch AS SELECT * FROM read_json_auto('{raw_file}')")
+
+            # 2. Check if the persistent table 'raw_shows' exists
+            table_check = con.execute("SELECT count(*) FROM information_schema.tables WHERE table_name = 'raw_shows'").fetchone()
+            table_exists = table_check[0] > 0 if table_check else False
+
+            if table_exists:
+                # Migration: Ensure 'version' column exists if table was created by older pipeline
+                cols = [row[1] for row in con.execute("PRAGMA table_info('raw_shows')").fetchall()]
+                if 'version' not in cols:
+                    logger.info("Migrating 'raw_shows': Adding 'version' column.")
+                    con.execute("ALTER TABLE raw_shows ADD COLUMN version INTEGER DEFAULT 1")
+
+                if 'is_latest' not in cols:
+                    logger.info("Migrating 'raw_shows': Adding 'is_latest' column.")
+                    con.execute("ALTER TABLE raw_shows ADD COLUMN is_latest BOOLEAN DEFAULT FALSE")
+                    con.execute("""
+                        UPDATE raw_shows 
+                        SET is_latest = TRUE 
+                        WHERE (id, version) IN (
+                            SELECT id, MAX(version) FROM raw_shows GROUP BY id
+                        )
+                    """)
+
+                # Mark existing records for incoming IDs as not latest
+                con.execute("UPDATE raw_shows SET is_latest = FALSE WHERE id IN (SELECT id FROM current_batch)")
+
+                # Append with version increment
+                append_query = """
+                INSERT INTO raw_shows 
+                SELECT 
+                    cb.*, 
+                    COALESCE(existing.max_ver, 0) + 1 AS version,
+                    TRUE AS is_latest
+                FROM current_batch cb
+                LEFT JOIN (
+                    SELECT id, MAX(version) as max_ver 
+                    FROM raw_shows 
+                    GROUP BY id
+                ) existing ON cb.id = existing.id
+                """
+                con.execute(append_query)
+                logger.info("Appended new batch to 'raw_shows' with versioning.")
+            else:
+                # First run: Create table and initialize version to 1
+                con.execute("CREATE TABLE raw_shows AS SELECT *, 1 AS version, TRUE AS is_latest FROM current_batch")
+                logger.info("Created table 'raw_shows' with initial data.")
+
+            # Clean up temp table
+            con.execute("DROP TABLE IF EXISTS current_batch")
+            
+        finally:
+            con.close()
 
 if __name__ == "__main__":
     pipeline = TVMazePipeline()
