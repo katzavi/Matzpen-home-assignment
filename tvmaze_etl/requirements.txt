@@ -1,0 +1,6 @@
+requests
+tenacity
+pydantic
+beautifulsoup4
+polars
+duckdb
