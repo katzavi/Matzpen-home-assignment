@@ -121,18 +121,24 @@ class TVMazePipeline:
         
         logger.info(f"Phase A Complete. Saved {len(all_raw_data)} raw records to {raw_file.name}")
 
+        # --- PHASE A.5: LOAD RAW TO DUCKDB ---
+        logger.info("--- Loading Raw Data to DuckDB ---")
+        self.ingest_raw_data(raw_file)
+
         # --- PHASE B: NORMALIZATION ---
         logger.info("--- Starting Phase B: Normalization ---")
-        df_normalized = self.process_normalization(all_raw_data)
+        # Fetch latest data from DuckDB (Source of Truth)
+        raw_data_from_db = self.fetch_latest_raw_data()
+        df_normalized = self.process_normalization(raw_data_from_db)
 
         # --- PHASE C: ENRICHMENT ---
         logger.info("--- Starting Phase C: Enrichment ---")
         enriched_file, stats_file = self.process_enrichment(df_normalized)
 
-        # --- PHASE D: LOADING TO DUCKDB ---
-        logger.info("--- Starting Phase D: Loading to DuckDB ---")
+        # --- PHASE D: LOADING DERIVED DATA TO DUCKDB ---
+        logger.info("--- Loading Derived Data to DuckDB ---")
         norm_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
-        self.load_to_duckdb(raw_file, norm_file, enriched_file, stats_file)
+        self.load_derived_to_duckdb(norm_file, enriched_file, stats_file)
 
         logger.info("--- Pipeline Finished Successfully ---")
 
@@ -152,7 +158,7 @@ class TVMazePipeline:
         df = pl.DataFrame(valid_records)
 
         # Ensure Date Column is actual Date Type (not string)
-        df = df.with_columns(pl.col("premiere_date").str.to_date(strict=False))
+        df = df.with_columns(pl.col("premiere_date").cast(pl.Date, strict=False))
 
         # Save as Parquet (Optimized for DuckDB)
         output_file = NORM_DIR / f"shows_normalized_{self.timestamp}.parquet"
@@ -200,8 +206,21 @@ class TVMazePipeline:
         logger.info(f"Phase C Complete. Saved enriched data and genre stats to {ENRICHED_DIR.name}")
         return enriched_file, stats_file
 
-    def load_to_duckdb(self, raw_file, norm_file, enriched_file, stats_file):
-        """Load generated files into DuckDB tables."""
+    def fetch_latest_raw_data(self):
+        """Fetch the latest version of raw data from DuckDB for processing."""
+        try:
+            with duckdb.connect(str(self.db_path)) as con:
+                logger.info("Fetching latest raw records from DuckDB...")
+                # Fetch data and convert to list of dicts manually to avoid pyarrow dependency
+                result = con.execute("SELECT * FROM raw_shows WHERE is_latest = TRUE")
+                columns = [desc[0] for desc in result.description]
+                return [dict(zip(columns, row)) for row in result.fetchall()]
+        except duckdb.IOException as e:
+            logger.error(f"Could not read from DuckDB: {e}")
+            raise
+
+    def ingest_raw_data(self, raw_file):
+        """Load raw JSONL into DuckDB with versioning."""
         try:
             con = duckdb.connect(str(self.db_path))
         except duckdb.IOException as e:
@@ -225,12 +244,27 @@ class TVMazePipeline:
                     logger.info("Migrating 'raw_shows': Adding 'version' column.")
                     con.execute("ALTER TABLE raw_shows ADD COLUMN version INTEGER DEFAULT 1")
 
+                if 'is_latest' not in cols:
+                    logger.info("Migrating 'raw_shows': Adding 'is_latest' column.")
+                    con.execute("ALTER TABLE raw_shows ADD COLUMN is_latest BOOLEAN DEFAULT FALSE")
+                    con.execute("""
+                        UPDATE raw_shows 
+                        SET is_latest = TRUE 
+                        WHERE (id, version) IN (
+                            SELECT id, MAX(version) FROM raw_shows GROUP BY id
+                        )
+                    """)
+
+                # Mark existing records for incoming IDs as not latest
+                con.execute("UPDATE raw_shows SET is_latest = FALSE WHERE id IN (SELECT id FROM current_batch)")
+
                 # Append with version increment
                 append_query = """
                 INSERT INTO raw_shows 
                 SELECT 
                     cb.*, 
-                    COALESCE(existing.max_ver, 0) + 1 AS version
+                    COALESCE(existing.max_ver, 0) + 1 AS version,
+                    TRUE AS is_latest
                 FROM current_batch cb
                 LEFT JOIN (
                     SELECT id, MAX(version) as max_ver 
@@ -242,12 +276,24 @@ class TVMazePipeline:
                 logger.info("Appended new batch to 'raw_shows' with versioning.")
             else:
                 # First run: Create table and initialize version to 1
-                con.execute("CREATE TABLE raw_shows AS SELECT *, 1 AS version FROM current_batch")
+                con.execute("CREATE TABLE raw_shows AS SELECT *, 1 AS version, TRUE AS is_latest FROM current_batch")
                 logger.info("Created table 'raw_shows' with initial data.")
 
             # Clean up temp table
             con.execute("DROP TABLE IF EXISTS current_batch")
             
+        finally:
+            con.close()
+
+    def load_derived_to_duckdb(self, norm_file, enriched_file, stats_file):
+        """Load normalized and enriched Parquet files into DuckDB."""
+        try:
+            con = duckdb.connect(str(self.db_path))
+        except duckdb.IOException as e:
+            logger.error(f"Could not acquire lock on DuckDB file: {self.db_path}")
+            return
+
+        try:
             # Load Normalized Data (Parquet)
             con.execute("DROP TABLE IF EXISTS normalized_shows")
             con.execute(f"CREATE TABLE normalized_shows AS SELECT * FROM read_parquet('{norm_file}')")
@@ -260,7 +306,7 @@ class TVMazePipeline:
             con.execute("DROP TABLE IF EXISTS genre_stats")
             con.execute(f"CREATE TABLE genre_stats AS SELECT * FROM read_parquet('{stats_file}')")
             
-            logger.info(f"DuckDB Load Complete. Tables 'raw_shows', 'normalized_shows', 'enriched_shows', and 'genre_stats' created in {self.db_path.name}")
+            logger.info(f"DuckDB Load Complete. Derived tables updated in {self.db_path.name}")
         finally:
             con.close()
 
