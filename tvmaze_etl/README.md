@@ -179,7 +179,7 @@ jobs:
           git add data/
           git commit -m "🤖 Automated Data Update" || exit 0
           git push
-
+```
 The following configuration ensures the pipeline only runs when manually triggered via the GitHub UI (`workflow_dispatch`), preventing unwanted automatic runs.
 
 ```yaml
@@ -219,3 +219,4 @@ jobs:
           git config --global user.email "actions@github.com"
           git add data/
           # Only commit if data changed
+```          
