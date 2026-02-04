@@ -1,13 +1,12 @@
 # 📐 Entity Relationship Diagram (ERD)
 
-This document outlines the schema of the data at each stage of the pipeline.
+This document outlines the schema of the actual data artifacts created by the pipeline.
 
-**Note:** The relationship between `enriched_shows` and `genre_stats` is logically handled via an **Unnest/Explode** operation on the `genres` array.
+**Note:** The `genre_stats` table is a derived view created by exploding the `genres` array in the Enriched layer.
 
 ```mermaid
 erDiagram
-    %% Raw Data Layer
-    %% Ingested directly from JSONL
+    %% Raw Data Layer (JSONL)
     raw_shows {
         INTEGER id
         STRING name
@@ -23,8 +22,7 @@ erDiagram
         STRING _links
     }
 
-    %% Normalized Layer
-    %% Cleaned, Validated, Type-Cast
+    %% Normalized Layer (Parquet)
     normalized_shows {
         INTEGER id PK
         STRING name
@@ -38,7 +36,7 @@ erDiagram
         STRING summary
     }
 
-    %% Enriched Layer (The Gold Table)
+    %% Enriched Layer (Parquet/DataFrame)
     %% Contains ALL normalized data + Business Logic
     enriched_shows {
         INTEGER id PK
@@ -51,31 +49,22 @@ erDiagram
         DATE premiere_date
         FLOAT rating
         STRING summary
-        %% Derived Columns Below %%
-        INTEGER years_since_premiere "Derived"
-        BOOLEAN is_active "Derived"
-        STRING popularity_category "Derived"
+        %% Derived Columns %%
+        INTEGER years_since_premiere "Calculated"
+        BOOLEAN is_active "Calculated"
+        STRING popularity_category "Calculated"
     }
 
-    %% Logical View: Exploded Genres
-    %% Represents the UNNEST(genres) operation for analysis
-    show_genres_exploded {
-        INTEGER show_id FK
-        STRING genre_name
-    }
-
-    %% Analytics Layer
-    %% Aggregated Statistics
+    %% Analytics View (Final Report)
     genre_stats {
         STRING genre_name PK
         FLOAT avg_rating "Aggregated"
         INTEGER show_count "Aggregated"
     }
 
-    %% Data Flow Relationships
+    %% Relationships & Transformations
     raw_shows ||--|| normalized_shows : "Clean & Validate"
-    normalized_shows ||--|| enriched_shows : "Enrich Business Logic"
+    normalized_shows ||--|| enriched_shows : "Enrich"
     
-    %% The Analytical Join Logic
-    enriched_shows ||--|{ show_genres_exploded : "1. UNNEST(genres)"
-    show_genres_exploded }|--|| genre_stats : "2. GROUP BY genre"
+    %% Accurate Description of the Transformation
+    enriched_shows ||--|{ genre_stats : "TRANSFORM: Explode(genres) -> GroupBy"
