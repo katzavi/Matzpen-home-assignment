@@ -125,16 +125,34 @@ You can query the generated DuckDB database using the CLI or Python:
 duckdb data/db/tvmaze.duckdb "SELECT * FROM genre_stats LIMIT 5"
 ```
 
-## Orchestration (Automated Scheduling)
+## ⏱️ Orchestration (Automated Scheduling)
 
-To automate the ETL process, we utilize **GitHub Actions** as our scheduler. This allows the pipeline to run independently without requiring a dedicated server.
+The pipeline is automated using **GitHub Actions**, removing the need for local execution. It handles the entire lifecycle: checking out code, setting up Python, running the ETL, and committing the results back to the repository.
 
-### How it works
-We defined a workflow that triggers on a **Cron Schedule** (daily). When triggered, a runner:
-1.  Checks out the code.
-2.  Installs Python dependencies.
-3.  Executes `src/pipeline.py`.
-4.  **Commits the new data** back to the repository.
+### ⚙️ How to Setup & Trigger
+
+**1. Enable Permissions (One-time Setup)**
+To allow the "Actions Bot" to save data back to your repository, you must enable write permissions:
+1.  Go to your repository **Settings**.
+2.  Navigate to **Actions** → **General**.
+3.  Scroll to "Workflow permissions" and select **"Read and write permissions"**.
+4.  Click **Save**.
+
+**2. Manual Trigger (For Testing)**
+You don't have to wait for the daily schedule to verify it works:
+1.  Go to the **Actions** tab in this repository.
+2.  Select **"Daily TVMaze ETL"** from the sidebar.
+3.  Click the **"Run workflow"** button.
+4.  Wait ~60 seconds for the job to complete.
+
+**3. Automatic Schedule**
+* **Frequency:** Runs automatically every day at **08:00 UTC**.
+* **Configuration:** Defined in `.github/workflows/daily_etl.yml`.
+
+### ✅ Verification
+After a successful run (manual or scheduled), the GitHub Actions Bot will automatically create a new commit.
+* **Check the commit history:** You will see a commit titled `🤖 Automated Data Update`.
+* **Check the files:** Navigate to `data/raw` or `data/normalized` to see the newly generated files (e.g., `shows_raw_2023...jsonl`).
 
 ### Configuration (`.github/workflows/daily_etl.yml`)
 ```yaml
