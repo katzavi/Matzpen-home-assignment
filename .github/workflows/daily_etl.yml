@@ -1,7 +1,6 @@
 name: TVMaze ETL (Manual)
 
 on:
-  # Allows manual triggering from the Actions tab
   workflow_dispatch:
 
 permissions:
@@ -11,6 +10,11 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     
+    # 👇 THIS IS THE FIX: We tell GitHub to work inside your project folder
+    defaults:
+      run:
+        working-directory: ./tvmaze_etl
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -32,5 +36,6 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
+          # Since we are in the tvmaze_etl folder, this correctly adds the data folder
           git add data/
-          # Only commit if data changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "🤖 Manual Data Update" && git push)
