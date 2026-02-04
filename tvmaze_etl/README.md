@@ -196,6 +196,11 @@ jobs:
   run-pipeline:
     runs-on: ubuntu-latest
     
+    # Critical: Execute commands inside the project subfolder
+    defaults:
+      run:
+        working-directory: ./tvmaze_etl
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -219,4 +224,5 @@ jobs:
           git config --global user.email "actions@github.com"
           git add data/
           # Only commit if data changed
+          git diff --quiet && git diff --staged --quiet || (git commit -m "🤖 Manual Data Update" && git push)
 ```          
