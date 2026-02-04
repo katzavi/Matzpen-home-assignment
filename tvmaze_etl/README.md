@@ -226,3 +226,28 @@ jobs:
           # Only commit if data changed
           git diff --quiet && git diff --staged --quiet || (git commit -m "🤖 Manual Data Update" && git push)
 ```          
+## 📊 How to Query the Data
+
+Since the architecture uses a **Data Lake** approach (storing data in Parquet files), you do not need to load data into a traditional database server. You can use **DuckDB** to query the files directly.
+
+### Step 1: Get the Latest Data
+After the GitHub Action runs, the new data exists in the remote repository. Pull it to your local machine:
+```bash
+git pull origin main
+```
+
+Step 2: Querying with SQL (Visual)
+
+If you use VS Code, we recommend the SQLTools extension with the DuckDB Driver.
+
+    Create Connection: Set the database file to :memory: (runs in RAM).
+
+    Run Query: You can treat the Parquet file path as a table.
+```sql
+-- Select top 5 rated shows from the latest Parquet file
+SELECT name, rating, genres, premiere_date
+FROM 'data/normalized/*.parquet'
+WHERE rating IS NOT NULL
+ORDER BY rating DESC
+LIMIT 5;
+```    
