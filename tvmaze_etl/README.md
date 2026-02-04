@@ -179,3 +179,43 @@ jobs:
           git add data/
           git commit -m "🤖 Automated Data Update" || exit 0
           git push
+
+The following configuration ensures the pipeline only runs when manually triggered via the GitHub UI (`workflow_dispatch`), preventing unwanted automatic runs.
+
+```yaml
+name: TVMaze ETL (Manual)
+
+on:
+  # Allows manual triggering from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ETL Pipeline
+        run: python src/pipeline.py
+
+      - name: Commit and Push Data
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add data/
+          # Only commit if data changed
