@@ -1,15 +1,60 @@
-# TVMaze ETL Pipeline
+# 📺 TVMaze ETL Pipeline
 
-A robust ETL (Extract, Transform, Load) pipeline that ingests TV show data from the TVMaze API, processes it using Python (Polars, Pydantic), and stores it in a DuckDB database for analytics.
+A resilient, scalable data pipeline designed to ingest, normalize, and analyze TV series data from the TVMaze API. This project implements a modern **ELT (Extract, Load, Transform)** architecture using Python, enforcing strict data quality and storage efficiency.
 
-## Features
+---
 
-- **Robust Ingestion**: Fetches data with automatic retries and pagination handling.
-- **Versioning**: Implements "Slowly Changing Dimension" Type 2-like logic in DuckDB to track data versions (`version`, `is_latest`).
-- **Data Quality**: Validates and cleans data using Pydantic models (HTML stripping, type casting).
-- **High Performance**: Uses Polars for fast in-memory processing and Parquet for intermediate storage.
-- **Embedded Database**: Uses DuckDB as the central data warehouse.
-- **Enrichment**: Calculates derived metrics (show age, active status) and aggregates genre statistics.
+## 🚀 Architecture & Logic
+
+The system is built on the **Medallion Architecture** pattern (Bronze $\rightarrow$ Silver $\rightarrow$ Gold), processing data through three distinct layers of quality.
+
+### 🥉 Phase A: Raw Layer (The "Bronze" Layer)
+**Goal:** Create an immutable, high-fidelity backup of the source data.
+
+* **Ingestion Logic:**
+    * **Pagination:** The script intelligently iterates through API pages (`page=0`, `page=1`...) until it collects the required minimum of 250 series. This ensures memory stability even if fetching thousands of records.
+    * **Resiliency (Tenacity):** We utilize the `tenacity` library to implement **Exponential Backoff**. If the API returns a `429 Too Many Requests` or a `500 Server Error`, the script pauses (2s, 4s, 8s...) and retries automatically instead of crashing.
+* **Storage Format: JSONL (Newline Delimited JSON)**
+    * We store data in `.jsonl` format. Unlike a standard JSON array (which requires loading the whole file to read), JSONL allows for **streaming** reads and writes, making it infinitely scalable for raw ingestion.
+
+### 🥈 Phase B: Normalized Layer (The "Silver" Layer)
+**Goal:** Clean, validate, and enforce a strict schema.
+
+* **Validation Logic (The "Gatekeeper"):**
+    * We use **Pydantic** to define a strict Data Model. Every single record from the Raw layer is passed through this validator.
+    * **Type Safety:** Fields like `rating` are coerced to `float`. If the API sends garbage data (e.g., `"rating": "TBD"`), the record is flagged and excluded from the clean dataset to prevent downstream failures.
+* **Cleaning Logic:**
+    * **HTML Parsing:** The API returns summaries with HTML tags (`<p><b>...`). We use a custom Pydantic Validator with **BeautifulSoup** to strip these tags, leaving only clean, human-readable text.
+    * **Standardization:** All column names are mapped to `snake_case` (e.g., `premiered` $\rightarrow$ `premiere_date`).
+* **Storage Format: Parquet**
+    * Data is saved as **Apache Parquet**. This is a **columnar** storage format that compresses data by ~90% compared to JSON. It allows analytical queries to scan only the columns they need (e.g., just "Rating") without reading the heavy "Summary" text, resulting in massive performance gains.
+
+### 🥇 Phase C: Enriched Layer (The "Gold" Layer)
+**Goal:** Derive business insights and aggregations.
+
+* **Enrichment Logic:**
+    * **Popularity Classifier:** A calculated column categorizes shows into `Top-Rated` (>8), `Average` (6-8), or `Low` (<6).
+    * **Content Freshness:** Calculates the `years_since_premiere` to analyze the age distribution of the content.
+* **Analytics:**
+    * **Genre Analysis:** Since shows can have multiple genres (e.g., `["Drama", "Sci-Fi"]`), we use an "Explode" operation to flatten the list and calculate the exact average rating per individual genre.
+
+---
+
+## 🛠️ Project Structure
+
+```text
+tvmaze_etl/
+├── .github/
+│   └── workflows/
+│       └── daily_etl.yml    # GitHub Actions Orchestration
+├── data/
+│   ├── raw/                 # Bronze Layer (JSONL)
+│   └── normalized/          # Silver Layer (Parquet)
+├── src/
+│   ├── pipeline.py          # Phases A & B (Ingest + Normalize)
+│   └── enrichment.py        # Phase C (Analytics & Reporting)
+├── requirements.txt         # Python dependencies
+└── README.md                # Project Documentation
 
 ## Project Structure
 
