@@ -1,6 +1,8 @@
-# Entity Relationship Diagram (ERD)
+# 📐 Entity Relationship Diagram (ERD)
 
-This document outlines the schema of the DuckDB tables created by the TVMaze ETL pipeline and the data flow between them.
+This document outlines the schema of the data at each stage of the pipeline.
+
+**Note:** The relationship between `enriched_shows` and `genre_stats` is logically handled via an **Unnest/Explode** operation on the `genres` array.
 
 ```mermaid
 erDiagram
@@ -8,33 +10,21 @@ erDiagram
     %% Ingested directly from JSONL
     raw_shows {
         INTEGER id
-        STRING url
         STRING name
         STRING type
         STRING language
         STRING[] genres
         STRING status
         INTEGER runtime
-        INTEGER averageRuntime
         STRING premiered
-        STRING ended
-        STRING officialSite
-        STRUCT schedule
         STRUCT rating
-        INTEGER weight
-        STRUCT network
-        STRUCT webChannel
-        STRUCT externals
-        STRUCT image
         STRING summary
         INTEGER updated
-        STRUCT _links
-        INTEGER version "SCD Type 2 Version"
-        BOOLEAN is_latest "Current Record Flag"
+        STRING _links
     }
 
     %% Normalized Layer
-    %% Cleaned and Validated Data
+    %% Cleaned, Validated, Type-Cast
     normalized_shows {
         INTEGER id PK
         STRING name
@@ -43,27 +33,49 @@ erDiagram
         STRING[] genres
         STRING status
         FLOAT runtime
-        DATE premiere_date "Standardized Date"
-        FLOAT rating "Extracted Float"
-        STRING summary "Cleaned Text"
+        DATE premiere_date
+        FLOAT rating
+        STRING summary
     }
 
-    %% Enriched Layer
-    %% Derived Metrics Added
+    %% Enriched Layer (The Gold Table)
+    %% Contains ALL normalized data + Business Logic
     enriched_shows {
         INTEGER id PK
+        STRING name
+        STRING type
+        STRING language
+        STRING[] genres
+        STRING status
+        FLOAT runtime
+        DATE premiere_date
+        FLOAT rating
+        STRING summary
+        %% Derived Columns Below %%
         INTEGER years_since_premiere "Derived"
         BOOLEAN is_active "Derived"
         STRING popularity_category "Derived"
     }
 
-    %% Analytics Layer
-    genre_stats {
-        STRING genres PK "Single Genre"
-        FLOAT avg_genre_rating "Aggregated"
+    %% Logical View: Exploded Genres
+    %% Represents the UNNEST(genres) operation for analysis
+    show_genres_exploded {
+        INTEGER show_id FK
+        STRING genre_name
     }
 
-    raw_shows ||--|| normalized_shows : "Cleans (is_latest=True)"
-    normalized_shows ||--|| enriched_shows : "Enriches"
-    enriched_shows }|--|{ genre_stats : "Aggregates by Genre"
-```
+    %% Analytics Layer
+    %% Aggregated Statistics
+    genre_stats {
+        STRING genre_name PK
+        FLOAT avg_rating "Aggregated"
+        INTEGER show_count "Aggregated"
+    }
+
+    %% Data Flow Relationships
+    raw_shows ||--|| normalized_shows : "Clean & Validate"
+    normalized_shows ||--|| enriched_shows : "Enrich Business Logic"
+    
+    %% The Analytical Join Logic
+    enriched_shows ||--|{ show_genres_exploded : "1. UNNEST(genres)"
+    show_genres_exploded }|--|| genre_stats : "2. GROUP BY genre"
